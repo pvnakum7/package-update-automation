@@ -1,0 +1,158 @@
+# Package Update Automation Script
+
+## Overview
+
+This repository contains a Bash automation script designed to run with a Jenkins Freestyle Pipeline. The script automatically checks and updates package dependencies across multiple repositories, creates Pull Requests (PRs) when updates are available, and generates detailed package update reports.
+
+The script supports automated dependency updates for the following application types:
+
+* Node.js / React.js / Angular projects
+* Python projects
+* Java Maven projects
+
+## Features
+
+* Clone repositories using GitHub or Bitbucket authentication.
+* Supports automated PR creation after package updates.
+* Supports multiple update levels:
+
+  * Patch updates
+  * Minor + Patch updates
+  * Major updates
+  * Major + Minor + Patch updates
+* Automatically detects the default development branch:
+
+  1. `dev`
+  2. `development`
+  3. `develop`
+  4. `main`
+* Skips PR creation when no package updates are available.
+* Generates package-level update reports.
+* Generates repository-level CSV summary reports.
+
+## Required Configuration
+
+The script requires repository access credentials, Git configuration details, package registry token, and email configuration.
+
+### GitHub / Bitbucket Credentials
+
+```bash
+BITBUCKET_USER="$BITBUCKET_USER"
+BITBUCKET_PASSWORD="$BITBUCKET_PASSWORD"
+
+GITHUB_USER="$GITHUB_USER"
+GITHUB_TOKEN="$GITHUB_TOKEN"
+```
+
+### Git User Configuration
+
+The configured Git user must have repository access to clone repositories and create Pull Requests.
+
+```bash
+GIT_USERNAME="gitusername"
+GIT_EMAIL="test@gmail.com"
+```
+
+### Package Registry Token
+
+```bash
+NPM_TOKEN="$GITHUB_TOKEN"
+```
+
+### Branch Configuration
+
+```bash
+BRANCH_NAME=""
+```
+
+If `BRANCH_NAME` is not provided, the script automatically searches for the supported development branches:
+
+```
+dev
+development
+develop
+main
+```
+
+The first available branch is selected for cloning and update operations.
+
+### Repository List
+
+Repositories are passed as a Jenkins string parameter using space-separated values:
+
+```bash
+REPO_LIST="${REPO_LIST}"
+```
+
+Example:
+
+```text
+repo1 repo2 repo3
+```
+
+## Email Configuration
+
+The script requires email server details for sending update reports.
+
+Required email configuration:
+
+* SMTP host
+* SMTP port
+* Email username
+* Email password
+* Sender email address
+
+## Package Update Flow
+
+1. Read repository list from Jenkins parameters.
+2. Clone each repository using configured Git credentials.
+3. Detect the available development branch.
+4. Identify project type:
+
+   * Node.js / React.js / Angular
+   * Python
+   * Java Maven
+5. Check available dependency updates.
+6. Apply configured update strategy.
+7. If package updates are available:
+
+   * Commit changes.
+   * Push update branch.
+   * Create Pull Request automatically.
+8. If no updates are available:
+
+   * Skip PR creation.
+   * Mark package status as up-to-date.
+
+## Package Update Report
+
+The script generates a package-level report containing:
+
+| Package Name | Old Version | New Version | Status   |
+| ------------ | ----------- | ----------- | -------- |
+| package-name | x.x.x       | y.y.y       | upgraded |
+
+Supported package statuses:
+
+* `skip`
+* `up-to-date`
+* `upgraded (patch)`
+* `upgraded (minor)`
+* `upgraded (major)`
+
+## Repository Summary CSV Report
+
+A consolidated CSV report is generated with update statistics for all repositories.
+
+Report includes:
+
+| Repository | Patch Count | Minor Count | Major Count | Failed Count | Total Updated |
+| ---------- | ----------- | ----------- | ----------- | ------------ | ------------- |
+
+All repository summaries are stored in a single CSV sheet.
+
+## Jenkins Integration
+
+The script is designed to run as a scheduled Jenkins Freestyle job. Jenkins parameters can be used to provide repository lists, credentials, and update configuration values.
+
+Jenkins Freestyle jobs support automated CI tasks through configured build steps, while Jenkins Pipeline provides additional workflow-as-code capabilities.
