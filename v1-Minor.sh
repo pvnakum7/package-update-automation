@@ -313,14 +313,9 @@ is_stable_lts() {
     local ver
     ver="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
 
-    # Reject unstable/pre-release versions
-    # Covers: alpha, beta, rc, snapshot, preview, ea, cr, milestone, dev, post
-    if [[ "$ver" =~ (alpha|beta|rc|snapshot|preview|ea|cr|milestone|m[0-9]+|\.dev|\.post) ]]; then
+    if [[ "$ver" =~ (^|[._-])(alpha[0-9]*|a[0-9]+|beta[0-9]*|b[0-9]+|rc[0-9]*|cr[0-9]*|m[0-9]+|milestone[0-9]*|ea[0-9]*|eap[0-9]*|preview[0-9]*|pre[0-9]*|pr[0-9]*|snapshot[0-9]*|snap[0-9]*|dev[0-9]*|post[0-9]*|nightly[0-9]*|candidate[0-9]*|cand[0-9]*|experimental[0-9]*|exp[0-9]*|canary[0-9]*|test[0-9]*|testing[0-9]*|incubating[0-9]*|incubator[0-9]*)([._-]|$) ]]; then
         return 1
     fi
-
-    # Must contain at least one number
-    [[ "$ver" =~ [0-9] ]] || return 1
 
     return 0
 }
