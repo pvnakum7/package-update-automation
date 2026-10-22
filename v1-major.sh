@@ -17,6 +17,9 @@ NPM_TOKEN="$GITHUB_TOKEN"
 BRANCH_NAME=""
 FEATURE_BRANCH="security_version_fix_major"
 
+# Update kind applied to .NET/NuGet packages (patch | minor | major | all)
+NUGET_MODE="major"
+
 REPO_LIST="${REPO_LIST}"   # Passed as Jenkins string parameter (space separated)
 PR_TITLE="Security Vulnerability Fix - Only Major updates (SKip minor/patch updates)"
 PR_DESC="This PR contains auto-fixed vulnerabilities via automation."
@@ -445,7 +448,7 @@ fetch_maven_metadata_versions() {
 
     echo "Trying metadata: $url" >&2
 
-    curl -fsSL "$url" 2>/dev/null \
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 60 "$url" 2>/dev/null \
         | grep -oP '(?<=<version>).*?(?=</version>)' \
         | while read -r v; do
             is_stable_lts "$v" || continue
@@ -488,7 +491,7 @@ fetch_mvnrepository_versions() {
 
     echo "Trying MVNRepository fallback: $url" >&2
 
-    curl -fsSL -A "Mozilla/5.0" "$url" 2>/dev/null \
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 60 -A "Mozilla/5.0" "$url" 2>/dev/null \
         | grep -oE "/artifact/$escaped_group/$artifact/[A-Za-z0-9._+:-]+" \
         | awk -F'/' '{print $NF}' \
         | grep -Ev '^versions$' \
@@ -614,12 +617,307 @@ get_latest_version() {
     return 0
 }
 
+# ===== .NET / NuGet helpers =====
+# NUGET_MODE (patch|minor|major|all) selects which kind of update is applied.
+# Sitecore.* packages are read from the Sitecore feed first, everything else from nuget.org first
+# (each feed is the fallback for the other).
+IFS= read -r -d '' NUGET_PY <<'PY'
+import sys, os, re, json, glob, time, urllib.request, urllib.error
+
+NUGET_ORG = os.environ.get("NUGET_ORG_URL", "https://api.nuget.org/v3-flatcontainer").rstrip("/")
+SITECORE = os.environ.get("NUGET_SITECORE_URL", "https://nuget.sitecore.com/resources/v3-flatcontainer").rstrip("/")
+FILES = ("*.csproj", "*.fsproj", "*.vbproj", "Directory.Packages.props", "Directory.Build.props", "packages.config")
+TAG = re.compile(r'<(PackageReference|PackageVersion|GlobalPackageReference)\b([^>]*?)(/?)>', re.S)
+CFG = re.compile(r'<package\b([^>]*?)/?>', re.I | re.S)
+STABLE = re.compile(r'^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?$')
+
+
+def read(path):
+    raw = open(path, 'rb').read()
+    return raw.decode('utf-8-sig', 'replace'), raw.startswith(b'\xef\xbb\xbf')
+
+
+def write(path, text, bom):
+    open(path, 'wb').write((b'\xef\xbb\xbf' if bom else b'') + text.encode('utf-8'))
+
+
+def attr(s, name):
+    m = re.search(r'\b%s\s*=\s*"([^"]*)"' % name, s, re.I)
+    return m
+
+
+def files_in(d):
+    out = []
+    for g in FILES:
+        out += glob.glob(os.path.join(d, g))
+    return sorted(set(out))
+
+
+def scan(path):
+    """-> [(name, version, (start, end))] for every package version found in one file."""
+    text, _ = read(path)
+    found = []
+    if os.path.basename(path).lower() == 'packages.config':
+        for m in CFG.finditer(text):
+            i, v = attr(m.group(1), 'id'), attr(m.group(1), 'version')
+            if i and v:
+                found.append((i.group(1), v.group(1), (m.start(1) + v.start(1), m.start(1) + v.end(1))))
+        return found
+    for m in TAG.finditer(text):
+        a = m.group(2)
+        n = attr(a, 'Include') or attr(a, 'Update')
+        if not n:
+            continue
+        v = attr(a, 'Version')
+        if v:
+            found.append((n.group(1), v.group(1), (m.start(2) + v.start(1), m.start(2) + v.end(1))))
+        elif not m.group(3):
+            end = text.find('</%s>' % m.group(1), m.end())
+            if end > 0:
+                vm = re.search(r'<Version>\s*([^<]+?)\s*</Version>', text[m.end():end])
+                if vm:
+                    found.append((n.group(1), vm.group(1), (m.end() + vm.start(1), m.end() + vm.end(1))))
+    return found
+
+
+def find_property(files, name):
+    for p in files:
+        text, _ = read(p)
+        m = re.search(r'<%s>\s*([^<$]+?)\s*</%s>' % (re.escape(name), re.escape(name)), text)
+        if m:
+            return p, m.group(1), (m.start(1), m.end(1))
+    return None
+
+
+def tup(v):
+    m = STABLE.match(v)
+    if not m:
+        return None
+    return tuple(int(x) if x else 0 for x in m.groups())
+
+
+def kind(c, n):
+    return 'major' if n[0] > c[0] else 'minor' if n[1] > c[1] else 'patch'
+
+
+def pick(cur, versions, mode):
+    c = [v for v in versions if v > cur]
+    if mode == 'patch':
+        c = [v for v in c if v[:2] == cur[:2]]
+    elif mode == 'minor':
+        c = [v for v in c if v[0] == cur[0] and v[1] > cur[1]]
+    elif mode == 'major':
+        c = [v for v in c if v[0] > cur[0]]
+    return max(c) if c else None
+
+
+_cache = {}
+
+
+def versions_of(name):
+    """-> (dict tuple->string of stable versions, error flag). Sitecore.* try the Sitecore feed first."""
+    key = name.lower()
+    if key in _cache:
+        return _cache[key]
+    feeds = [SITECORE, NUGET_ORG] if key.startswith('sitecore.') else [NUGET_ORG, SITECORE]
+    failed = False
+    for feed in feeds:
+        url = '%s/%s/index.json' % (feed, key)
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(url, timeout=25) as r:
+                    data = json.load(r)
+                vs = {}
+                for s in data.get('versions', []):
+                    t = tup(s)
+                    if t and t not in vs:
+                        vs[t] = s
+                if vs:
+                    _cache[key] = (vs, False)
+                    return _cache[key]
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    break
+                failed = True
+                time.sleep(1 + attempt)
+            except Exception:
+                failed = True
+                time.sleep(1 + attempt)
+    _cache[key] = ({}, failed)
+    return _cache[key]
+
+
+def plan(mode, d):
+    files = files_in(d)
+    skip = os.environ.get('NAME_SKIP_PATTERN', '')
+    rows = []
+    for p in files:
+        for name, ver, _ in scan(p):
+            e = {'file': p, 'name': name, 'raw': ver, 'op': 'pkg', 'efile': p, 'ename': name, 'group': None}
+            if ver.startswith('$(') and ver.endswith(')'):
+                prop = ver[2:-1]
+                hit = find_property(files, prop)
+                if not hit:
+                    e.update(status='SKIP', label='SKIPPED (VARIABLE)', cur=ver)
+                    rows.append(e)
+                    continue
+                e.update(op='prop', efile=hit[0], ename=prop, cur=hit[1], group='P:' + prop)
+            else:
+                e['cur'] = ver
+            rows.append(e)
+    for e in rows:
+        if e.get('status'):
+            continue
+        cur = tup(e['cur'])
+        if skip and re.search(skip, e['name'], re.I):
+            e.update(status='SKIP', label='SKIPPED (NAMED)')
+        elif cur is None:
+            e.update(status='SKIP', label='SKIPPED (RANGE)')
+        else:
+            vs, err = versions_of(e['name'])
+            if not vs:
+                e.update(status='FAIL' if err else 'SKIP',
+                         label='FAILED (SOURCE ERROR)' if err else 'SKIPPED (NOT FOUND)')
+                continue
+            e['vs'] = vs
+            e['curt'] = cur
+            top = max(vs)
+            new = pick(cur, list(vs), mode)
+            e['latest'] = vs[top] if top > cur else e['cur']
+            e['newt'] = new
+            if top <= cur:
+                e.update(status='UPTODATE', label='UP-TO-DATE')
+            elif new is None:
+                e.update(status='SKIP', label='SKIPPED (%s)' % kind(cur, top))
+            else:
+                e.update(status='UPGRADE')
+    # Packages that must move together: one MSBuild property, or Sitecore.* packages sharing a version.
+    groups = {}
+    for e in rows:
+        if e.get('status') in ('UPGRADE', 'SKIP', 'UPTODATE') and 'vs' in e:
+            g = e['group']
+            if g is None and e['name'].lower().startswith('sitecore.') and os.environ.get('SITECORE_ALIGN', 'true') == 'true':
+                g = e['group'] = 'S:' + e['cur']
+            if g is None:
+                g = e['group'] = 'N:%s:%s' % (e['file'], e['name'])
+            groups.setdefault(g, []).append(e)
+    for g, members in groups.items():
+        if len(members) > 1 and any(m['status'] == 'UPGRADE' for m in members):
+            common = set(members[0]['vs'])
+            for m in members[1:]:
+                common &= set(m['vs'])
+            target = pick(members[0]['curt'], sorted(common), mode)
+            for m in members:
+                if target is not None and m['status'] in ('UPGRADE', 'UPTODATE', 'SKIP'):
+                    m['newt'] = target
+                    m['latest'] = m['vs'][target]
+                    m['status'] = 'UPGRADE'
+                elif m['status'] == 'UPGRADE':
+                    m.update(status='SKIP', label='SKIPPED (INCOMPATIBLE)')
+        first = True
+        for m in members:
+            if m['status'] == 'UPGRADE':
+                m['new'] = m['vs'][m['newt']]
+                if m['op'] == 'prop' and not first:
+                    m['op'] = 'none'
+                first = False
+    for e in rows:
+        st = e.get('status', 'SKIP')
+        if st == 'UPGRADE':
+            k = kind(e['curt'], e['newt'])
+            vals = [st, k, e['name'], e['cur'], e['new'], e['new'], e['group'], e['op'], e['efile'], e['ename'], '-']
+        else:
+            lat = e.get('latest', e['cur'])
+            vals = [st, '-', e['name'], e['cur'], '-', lat, '-', 'none', '-', '-', e.get('label', '-')]
+        print('\t'.join(str(v).replace('\t', ' ') for v in vals))
+
+
+def apply(op, efile, ename, old, new):
+    if op == 'none':
+        return 0
+    text, bom = read(efile)
+    if op == 'prop':
+        hit = find_property([efile], ename)
+        spans = [hit[2]] if hit and hit[1] == old else []
+    else:
+        spans = [s for n, v, s in scan(efile) if n.lower() == ename.lower() and v == old]
+    if not spans:
+        return 3
+    for a, b in sorted(spans, reverse=True):
+        text = text[:a] + new + text[b:]
+    write(efile, text, bom)
+    return 0
+
+
+if __name__ == '__main__':
+    cmd = sys.argv[1]
+    if cmd == 'plan':
+        plan(sys.argv[2], sys.argv[3])
+    elif cmd == 'apply':
+        sys.exit(apply(*sys.argv[2:7]))
+    elif cmd == 'files':
+        print('\n'.join(files_in(sys.argv[2])))
+PY
+
+nuget_py() {
+    "$PYTHON_CMD" -c "$NUGET_PY" "$@"
+}
+
+has_dotnet_files() {
+    local d="$1" f
+    for f in "$d"/*.csproj "$d"/*.fsproj "$d"/*.vbproj "$d"/Directory.Packages.props "$d"/packages.config; do
+        [ -f "$f" ] && return 0
+    done
+    return 1
+}
+
+nuget_restore_snap() {
+    local f
+    for f in "$NUGET_TMP"/snap/*; do
+        [ -f "$f" ] && cp "$f" "./$(basename "$f")"
+    done
+}
+
+# Applies every planned change of one group (rows of NUGET_ROWS) and proves the folder still restores.
+nuget_apply_group() {
+    local grp="$1" r st kd name cur new latest g op efile ename label f p extra
+    rm -rf "$NUGET_TMP/snap"; mkdir -p "$NUGET_TMP/snap"
+    for f in *.csproj *.fsproj *.vbproj Directory.Packages.props Directory.Build.props packages.config packages.lock.json; do
+        [ -f "$f" ] && cp "$f" "$NUGET_TMP/snap/$f"
+    done
+    for r in "${NUGET_ROWS[@]}"; do
+        IFS=$'\t' read -r st kd name cur new latest g op efile ename label <<< "$r"
+        [ "$st" = "UPGRADE" ] && [ "$g" = "$grp" ] || continue
+        if ! nuget_py apply "$op" "$efile" "$ename" "$cur" "$new"; then
+            echo "Could not edit $name in $efile" >&2
+            nuget_restore_snap
+            return 1
+        fi
+    done
+    if command -v dotnet &>/dev/null; then
+        extra=""
+        [ -f packages.lock.json ] && extra="--force-evaluate"
+        for p in *.csproj *.fsproj *.vbproj; do
+            [ -f "$p" ] || continue
+            if ! dotnet restore "$p" -v q $extra > "$NUGET_TMP/restore.log" 2>&1; then
+                tail -5 "$NUGET_TMP/restore.log" >&2
+                nuget_restore_snap
+                return 1
+            fi
+        done
+    else
+        echo "dotnet not found - restore validation skipped for group $grp" >&2
+    fi
+    return 0
+}
+
 # ===== Version Classification Function =====
 classify_version_update() {
     local current=$1
     local latest=$2
 
-    IFS='.' read -r c_major c_minor c_path <<< "$current"
+    IFS='.' read -r c_major c_minor c_patch <<< "$current"
     IFS='.' read -r l_major l_minor l_patch <<< "$latest"
 
     if [[ "$l_major" -gt "$c_major" ]]; then
@@ -718,6 +1016,7 @@ has_tech_stack_files() {
     [ -f "$d/setup.py" ] && return 0
     [ -f "$d/Pipfile" ] && return 0
     [ -f "$d/composer.json" ] && return 0
+    has_dotnet_files "$d" && return 0
     return 1
 }
 
@@ -752,6 +1051,12 @@ detect_project_tech_stack() {
         echo "Gradle"
         return
     fi
+    # .NET / NuGet
+    if has_dotnet_files "$d"; then
+        echo "DotNet"
+        return
+    fi
+
     echo "unknown"
 }
 
@@ -1777,8 +2082,12 @@ for repo in $REPO_LIST; do
             continue
         fi
 
+        PY_IS_TOML=""
         if [ "$PYTHON_MANIFEST" = "requirements.txt" ]; then
             REQ_FILE="requirements.txt"
+        elif [ "$PYTHON_MANIFEST" = "pyproject.toml" ]; then
+            REQ_FILE="pyproject.toml"
+            PY_IS_TOML=1
         else
             echo "Detected Python manifest: $PYTHON_MANIFEST"
             echo "This updater currently supports pinned requirements-based dependency updates."
@@ -1803,6 +2112,12 @@ for repo in $REPO_LIST; do
         grep -v '^[[:space:]]*#' | \
         grep -v '^[[:space:]]*$' | \
         grep '==' > "$PINNED"
+
+        # pyproject.toml: take the "name==version" strings of [project] / [dependency-groups]
+        if [ -n "$PY_IS_TOML" ]; then
+            grep -oE '"[A-Za-z0-9_.-]+(\[[^]"]*\])?[[:space:]]*==[[:space:]]*[0-9][^",;[:space:]]*' "$REQ_FILE" \
+                | tr -d '"' | sort -u > "$PINNED"
+        fi
 
         if [ ! -s "$PINNED" ]; then
             echo "No pinned dependencies found in $REQ_FILE"
@@ -1836,6 +2151,7 @@ for repo in $REPO_LIST; do
         while IFS= read -r dep || [[ -n "$dep" ]]; do
             pkg="${dep%%==*}"
             pkg="$(echo "$pkg" | xargs)"               # UPDATED: trim spaces
+            pkg="${pkg%%\[*}"                          # drop extras: name[extra] -> name
             cur="${dep##*==}"
             cur="${cur%,}"; cur="${cur%$'\r'}"         # UPDATED: clean comma/CR
 
@@ -1844,7 +2160,7 @@ for repo in $REPO_LIST; do
             ((TOTAL_COUNT++))
 
             JSON="$TMP_DIR/$key.json"
-            curl -sSf "https://pypi.org/pypi/$pkg/json" -o "$JSON" || {
+            curl -sSf --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 60 "https://pypi.org/pypi/$pkg/json" -o "$JSON" || {
                 ((SKIPPED_COUNT++))
                 printf "%-30s | %-12s | %-12s | %-10s\n" \
                     "$pkg" "$cur" "$cur" "SKIPPED" >> "$REPORT"
@@ -1854,6 +2170,7 @@ for repo in $REPO_LIST; do
         new_ver=$($PYTHON_CMD - "$JSON" "$cur" <<'PY'
 import sys, json, re
 from packaging.version import Version, InvalidVersion
+from packaging.specifiers import SpecifierSet
 
 json_file = sys.argv[1]
 current_raw = sys.argv[2]
@@ -1868,9 +2185,11 @@ try:
 except InvalidVersion:
     sys.exit(0)
 
-cur_rel = current.release
-if len(cur_rel) < 3:
-    sys.exit(0)
+cur_rel = tuple(current.release) + (0,) * (3 - len(current.release))
+
+# Interpreter used to judge "Requires-Python" of candidate releases (override: PKGUPDATE_PYTHON_VERSION)
+import os
+TARGET_PYTHON = os.environ.get("PKGUPDATE_PYTHON_VERSION") or "%d.%d.%d" % sys.version_info[:3]
 
 cur_major = cur_rel[0]
 cur_minor = cur_rel[1]
@@ -1884,7 +2203,7 @@ def valid_candidate(ver):
         v = Version(ver)
     except InvalidVersion:
         return False
-    return len(v.release) == 3
+    return 2 <= len(v.release) <= 4
 
 best = None
 
@@ -1896,8 +2215,20 @@ for r in data.get("releases", {}):
     except InvalidVersion:
         continue
 
+    files = data.get("releases", {}).get(r) or []
+    if files and all(f.get("yanked") for f in files):
+        continue
+    rp = next((f.get("requires_python") for f in files if f.get("requires_python")), None)
+    if rp:
+        try:
+            if not SpecifierSet(rp).contains(TARGET_PYTHON, prereleases=True):
+                continue
+        except Exception:
+            pass
+    rel = tuple(v.release) + (0,) * (3 - len(v.release))
+
     # ALLOW only minor upgrades (same major, higher minor; skip patch-only updates)
-    if len(v.release) >= 3 and v.release[0] > cur_major:
+    if rel[0] > cur_major:
         if best is None or v > best:
             best = v
 
@@ -2020,11 +2351,151 @@ PY
 
         mv "$TMP_DIR/new.txt" "$REQ_FILE"
 
-        if [ "$APPDIR" = "." ]; then
-            CHANGED_FILES+=("requirements.txt")
-        else
-            CHANGED_FILES+=("$APPDIR/requirements.txt")
+        if [ -n "$PY_IS_TOML" ]; then
+            for k in "${!UPDATES[@]}"; do
+                sed -i -E "s/(\"$k(\\[[^]\"]*\\])?[[:space:]]*==[[:space:]]*)[0-9][^\",;[:space:]]*/\1${UPDATES[$k]}/I" "$REQ_FILE"
+            done
+            # Keep uv.lock in step with the edited pins; undo everything if it cannot be resolved
+            if [ -f uv.lock ] && [ "${#UPDATES[@]}" -gt 0 ]; then
+                if command -v uv &>/dev/null; then
+                    cp uv.lock "$TMP_DIR/uv.lock.chk"
+                    if ! uv lock >/dev/null 2>&1; then
+                        echo "uv lock failed - reverting $REQ_FILE and uv.lock"
+                        cp "$REQ_BAK" "$REQ_FILE"; cp "$TMP_DIR/uv.lock.chk" uv.lock
+                        echo "NOTE: uv lock could not resolve the updated pins; $REQ_FILE was left unchanged" >> "$REPORT"
+                        UPDATES=()
+                    fi
+                else
+                    echo "uv not found - uv.lock was not refreshed"
+                fi
+            fi
         fi
+
+        if [ "$APPDIR" = "." ]; then
+            CHANGED_FILES+=("${REQ_FILE#./}")
+            [ -n "$PY_IS_TOML" ] && [ -f uv.lock ] && CHANGED_FILES+=("uv.lock")
+        else
+            CHANGED_FILES+=("$APPDIR/${REQ_FILE#./}")
+            [ -n "$PY_IS_TOML" ] && [ -f uv.lock ] && CHANGED_FILES+=("$APPDIR/uv.lock")
+        fi
+
+        echo "$TECH_STACK application processed for folder: $FOLDER_LABEL"
+
+    elif [[ "$(echo "$TECH_STACK" | tr '[:upper:]' '[:lower:]')" == "dotnet" ]]; then
+        echo "Running .NET/NuGet dependency major upgrade..."
+        echo "Folder '$APPDIR' will use NuGet dependency handling"
+
+        TOTAL_COUNT=0
+        UPDATE_COUNT=0
+        SKIPPED_COUNT=0
+        FAILED_COUNT=0
+
+        PATCH_COUNT=0
+        MINOR_COUNT=0
+        MAJOR_COUNT=0
+
+        if command -v python3 &>/dev/null; then
+            PYTHON_CMD="python3"
+        elif command -v python &>/dev/null; then
+            PYTHON_CMD="python"
+        else
+            echo "Python not found."
+            continue
+        fi
+
+        NUGET_TMP=$(mktemp -d)
+        mkdir -p "$NUGET_TMP/orig"
+        for f in *.csproj *.fsproj *.vbproj Directory.Packages.props Directory.Build.props packages.config packages.lock.json; do
+            [ -f "$f" ] && cp "$f" "$NUGET_TMP/orig/$f"
+        done
+
+        if ! NAME_SKIP_PATTERN="react-quill|some-legacy-package" nuget_py plan "$NUGET_MODE" . > "$NUGET_TMP/plan.tsv" 2> "$NUGET_TMP/plan.err"; then
+            echo "NuGet analysis failed for folder: $APPDIR"
+            cat "$NUGET_TMP/plan.err"
+            rm -rf "$NUGET_TMP"
+            continue
+        fi
+        mapfile -t NUGET_ROWS < "$NUGET_TMP/plan.tsv"
+
+        printf "%-30s | %-12s | %-12s | %-20s\n" \
+        "PACKAGE" "CURRENT" "LATEST" "STATUS" >> "$REPORT"
+        printf "%-30s-+-%-12s-+-%-12s-+-%-20s\n" \
+        "------------------------------" "------------" "------------" "--------------------" >> "$REPORT"
+
+        declare -A NUGET_RESULT=()
+        for row in "${NUGET_ROWS[@]}"; do
+            IFS=$'\t' read -r st kd name cur new latest grp op efile ename label <<< "$row"
+            TOTAL_COUNT=$((TOTAL_COUNT+1))
+            case "$st" in
+                UPTODATE)
+                    printf "%-30s | %-12s | %-12s | %-20s\n" "$name" "$cur" "$latest" "UP-TO-DATE" >> "$REPORT"
+                    ((SKIPPED_COUNT++))
+                    ;;
+                SKIP)
+                    printf "%-30s | %-12s | %-12s | %-20s\n" "$name" "$cur" "$latest" "$label" >> "$REPORT"
+                    ((SKIPPED_COUNT++))
+                    ;;
+                FAIL)
+                    printf "%-30s | %-12s | %-12s | %-20s\n" "$name" "$cur" "NA" "$label" >> "$REPORT"
+                    ((FAILED_COUNT++))
+                    ;;
+                UPGRADE)
+                    if [ -z "${NUGET_RESULT[$grp]:-}" ]; then
+                        if nuget_apply_group "$grp"; then NUGET_RESULT[$grp]="ok"; else NUGET_RESULT[$grp]="fail"; fi
+                    fi
+                    if [ "${NUGET_RESULT[$grp]}" = "ok" ]; then
+                        printf "%-30s | %-12s | %-12s | %-20s\n" "$name" "$cur" "$new" "UPGRADED ($kd)" >> "$REPORT"
+                        ((UPDATE_COUNT++))
+                        case "$kd" in
+                            patch) ((PATCH_COUNT++)) ;;
+                            minor) ((MINOR_COUNT++)) ;;
+                            major) ((MAJOR_COUNT++)) ;;
+                        esac
+                    else
+                        printf "%-30s | %-12s | %-12s | %-20s\n" "$name" "$cur" "$new" "FAILED (INSTALL ERROR)" >> "$REPORT"
+                        ((FAILED_COUNT++))
+                    fi
+                    ;;
+            esac
+        done
+
+        {
+            echo "=============================================="
+            echo "DEPENDENCY SUMMARY"
+            echo "=============================================="
+            echo ""
+            echo "Total dependencies analyzed         : $TOTAL_COUNT"
+            echo "Upgraded Count (patch+minor)  : $UPDATE_COUNT"
+            echo "Skipped (pre-release/unknown)       : $SKIPPED_COUNT"
+            echo "Failed (Due to compatibility issues): $FAILED_COUNT"
+            echo ""
+            echo "Only Patch updates                  : $PATCH_COUNT"
+            echo "Minor updates                       : $MINOR_COUNT"
+            echo "Major Updates (upgraded)            : $MAJOR_COUNT"
+            echo "=============================================="
+
+            echo "Date: $(date)"
+        } >> "$REPORT"
+        
+        REPO_TOTAL_COUNT=$((REPO_TOTAL_COUNT + TOTAL_COUNT))
+        REPO_UPDATE_COUNT=$((REPO_UPDATE_COUNT + UPDATE_COUNT))
+        REPO_SKIPPED_COUNT=$((REPO_SKIPPED_COUNT + SKIPPED_COUNT))
+        REPO_FAILED_COUNT=$((REPO_FAILED_COUNT + FAILED_COUNT))
+        REPO_PATCH_COUNT=$((REPO_PATCH_COUNT + PATCH_COUNT))
+        REPO_MINOR_COUNT=$((REPO_MINOR_COUNT + MINOR_COUNT))
+        REPO_MAJOR_COUNT=$((REPO_MAJOR_COUNT + MAJOR_COUNT))
+
+        for f in *.csproj *.fsproj *.vbproj Directory.Packages.props Directory.Build.props packages.config packages.lock.json; do
+            [ -f "$f" ] || continue
+            if [ ! -f "$NUGET_TMP/orig/$f" ] || ! cmp -s "$f" "$NUGET_TMP/orig/$f"; then
+                if [ "$APPDIR" = "." ]; then
+                    CHANGED_FILES+=("$f")
+                else
+                    CHANGED_FILES+=("$APPDIR/$f")
+                fi
+            fi
+        done
+        rm -rf "$NUGET_TMP"
 
         echo "$TECH_STACK application processed for folder: $FOLDER_LABEL"
 
